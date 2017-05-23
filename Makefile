@@ -1,6 +1,6 @@
 CC := gcc
-ARCHS := -arch i386 -arch x86_64
-CFLAGS := -c -std=c99 -O2 -pedantic -Wall -Wextra $(ARCHS) -D_LARGEFILE_SOURCE -D_FILE_OFFSET_BITS=64
+ARCHS := -m64
+CFLAGS := -c -std=c99 -O2 -pedantic -I cctools/include -Wall -Wextra $(ARCHS) -D_LARGEFILE_SOURCE -D_FILE_OFFSET_BITS=64
 LD := gcc
 LDFLAGS := $(ARCHS)
 
