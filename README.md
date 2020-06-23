@@ -2,7 +2,15 @@
 
 ### Building
 
-    make
+   `make ARCHS="-arch x86_64"`
+
+Add more `-arch` options to `ARCHS` if you wish to make a FAT binary.  This
+specifies what host architectures to support.  It does not affect what
+architectures the built `unsign` binary will handle.
+
+### Testing
+
+    `make test`
 
 ### Installing
 

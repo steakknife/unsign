@@ -25,6 +25,7 @@
 #include "endian.h"
 
 #include <assert.h>
+#include <stdarg.h>
 #include <stdio.h>
 #include <stdbool.h>
 #include <stdlib.h>
@@ -39,6 +40,18 @@
 #include <mach-o/loader.h>
 
 #define BUF_SZ 4096
+
+static const char* program_name = NULL;
+static bool verbose = false;
+
+static void debug(const char* fmt, ...) {
+        if (verbose) {
+                va_list vargs;
+                va_start(vargs, fmt);
+                vprintf(fmt, vargs);
+                va_end(vargs);
+        }
+}
 
 static void
 expect(bool b, const char* s) {
@@ -95,6 +108,8 @@ static void
 macho_unsign(FILE *in, FILE *out, const char *infile, const char *outfile, off_t size) {
         off_t start = ftello(in);
         expect(start != -1, infile);
+        off_t out_start = ftello(out);
+        expect(out_start != -1, outfile);
 
         uint8_t magicb[4];
         expect(fread(&magicb, sizeof(magicb), 1, in) == 1, infile);
@@ -127,22 +142,22 @@ macho_unsign(FILE *in, FILE *out, const char *infile, const char *outfile, off_t
 
         uint32_t ncmds;
         uint32_t sizeofcmds;
+        union {
+          struct mach_header mh;
+          struct mach_header_64 mh64;
+        } header;
         if (sixtyfourbits) {
-                struct mach_header_64 header;
-                expect(fread(&header, sizeof(header), 1, in) == 1, infile);
-                ncmds = x32dec(&header.ncmds);
-                sizeofcmds = x32dec(&header.sizeofcmds);
-                x32enc(&header.ncmds, ncmds - 1);
-                x32enc(&header.sizeofcmds, sizeofcmds - sizeof(struct linkedit_data_command));
-                expect(fwrite(&header, sizeof(header), 1, out) == 1, outfile);
+                struct mach_header_64* mh = &(header.mh64);
+                expect(fread(mh, sizeof(*mh), 1, in) == 1, infile);
+                ncmds = x32dec(&mh->ncmds);
+                sizeofcmds = x32dec(&mh->sizeofcmds);
+                expect(fwrite(mh, sizeof(*mh), 1, out) == 1, outfile);
         } else {
-                struct mach_header header;
-                expect(fread(&header, sizeof(header), 1, in) == 1, infile);
-                ncmds = x32dec(&header.ncmds);
-                sizeofcmds = x32dec(&header.sizeofcmds);
-                x32enc(&header.ncmds, ncmds - 1);
-                x32enc(&header.sizeofcmds, sizeofcmds - sizeof(struct linkedit_data_command));
-                expect(fwrite(&header, sizeof(header), 1, out) == 1, outfile);
+                struct mach_header* mh = &(header.mh);
+                expect(fread(mh, sizeof(*mh), 1, in) == 1, infile);
+                ncmds = x32dec(&mh->ncmds);
+                sizeofcmds = x32dec(&mh->sizeofcmds);
+                expect(fwrite(mh, sizeof(*mh), 1, out) == 1, outfile);
         }
 
         uint32_t dataoff = 0, datasize = 0;
@@ -159,7 +174,7 @@ macho_unsign(FILE *in, FILE *out, const char *infile, const char *outfile, off_t
                 if (cmd != LC_CODE_SIGNATURE) {
                         fcopy(cmdsize, in, out, infile, outfile);
                 } else {
-                        printf("    found LC_CODE_SIGNATURE\n");
+                        debug("    found LC_CODE_SIGNATURE\n");
                         assert(dataoff == 0);
                         struct linkedit_data_command lc_sig;
                         assert(cmdsize == sizeof(lc_sig));
@@ -169,16 +184,45 @@ macho_unsign(FILE *in, FILE *out, const char *infile, const char *outfile, off_t
                         datasize = x32dec(&lc_sig.datasize);
                 }
         }
-        assert(dataoff != 0);
-        expect(fzero(sizeof(struct linkedit_data_command), 1, out) == 1, outfile);
-        off_t after_lc = ftello(in);
-        expect(after_lc != -1, infile);
-        fcopy(dataoff - (after_lc - start), in, out, infile, outfile);
-        expect(fzero(1, datasize, out) == datasize, outfile);
-        expect(fseeko(in, datasize, SEEK_CUR) != -1, infile);
+        if (dataoff != 0) {
+                /* We have removed the LC_CODE_SIGNATURE load command.  We
+                 * need to fill output with zeroes to ensure data is still at
+                 * same offsets.
+                 */
+                expect(fzero(sizeof(struct linkedit_data_command), 1, out) == 1, outfile);
+
+                /* Copy data up to the code signature data.  */
+                off_t after_lc = ftello(in);
+                expect(after_lc != -1, infile);
+                fcopy(dataoff - (after_lc - start), in, out, infile, outfile);
+
+                /* Zero out the code signature data, and skip it in the input
+                 * file.
+                 */
+                expect(fzero(1, datasize, out) == datasize, outfile);
+                expect(fseeko(in, datasize, SEEK_CUR) != -1, infile);
+        }
         off_t after_data = ftello(in);
         expect(after_data != -1, infile);
         fcopy(size - (after_data - start), in, out, infile, outfile);
+        if (dataoff != 0) {
+                /* Update the header with new load command info. */
+                off_t out_after_data = ftello(out);
+                expect(out_after_data != -1, outfile);
+                expect(fseeko(out, out_start, SEEK_SET) != -1, outfile);
+                if (sixtyfourbits) {
+                        struct mach_header_64* mh = &(header.mh64);
+                        x32enc(&mh->ncmds, ncmds - 1);
+                        x32enc(&mh->sizeofcmds, sizeofcmds - sizeof(struct linkedit_data_command));
+                        expect(fwrite(mh, sizeof(*mh), 1, out) == 1, outfile);
+                } else {
+                        struct mach_header* mh = &(header.mh);
+                        x32enc(&mh->ncmds, ncmds - 1);
+                        x32enc(&mh->sizeofcmds, sizeofcmds - sizeof(struct linkedit_data_command));
+                        expect(fwrite(mh, sizeof(*mh), 1, out) == 1, outfile);
+                }
+                expect(fseeko(out, out_after_data, SEEK_SET) != -1, outfile);
+        }
 }
 
 static void
@@ -188,7 +232,7 @@ ub_unsign(FILE *in, FILE *out, const char *infile, const char *outfile, off_t si
         if (be32dec(&magicb) != FAT_MAGIC) {
                 expect(! fseeko(in, 0, SEEK_SET), infile);
                 macho_unsign(in, out, infile, outfile, size);
-                printf("not a fat binary\n");
+                debug("not a fat binary\n");
                 return;
         }
 
@@ -206,7 +250,7 @@ ub_unsign(FILE *in, FILE *out, const char *infile, const char *outfile, off_t si
         expect(fzero(sizeof(struct fat_arch), nfat_arch, out) == nfat_arch, outfile);
 
         for (uint32_t i = 0; i < nfat_arch; i++) {
-                printf("  processing fat architecture %d of %d\n", i+1, nfat_arch);
+                debug("  processing fat architecture %d of %d\n", i+1, nfat_arch);
                 struct fat_arch arch;
                 expect(fread(&arch, sizeof(arch), 1, in) == 1, infile);
                 off_t inarcho = ftello(in);
@@ -251,11 +295,39 @@ ub_unsign(FILE *in, FILE *out, const char *infile, const char *outfile, off_t si
 
 const char *suffix = ".unsigned";
 
+static void
+usage(int exit_code) {
+        printf("usage: %s [-v] file [outfile]\n", program_name);
+        exit(exit_code);
+}
+
 int
 main(int argc, const char *const *argv) {
+
+        program_name = argv[0];
+        while(argc > 1 && argv[1][0] == '-') {
+                if(strcmp(argv[1], "--") == 0) {
+                        --argc;
+                        ++argv;
+                        break;
+                }
+                else if (strcmp(argv[1], "-v") == 0) {
+                        verbose = true;
+                }
+                else if (strcmp(argv[1], "-h") == 0) {
+                        usage(0);
+                }
+                else {
+                        fprintf(stderr, "Unrecognised option: %s\n", argv[1]);
+                        usage(1);
+                }
+
+                --argc;
+                ++argv;
+        }
+
         if(argc < 2 || argc > 3) {
-                puts("usage: unsign file [outfile]");
-                return 1;
+                usage(1);
         }
 
         const char *infile = argv[1];
@@ -277,7 +349,7 @@ main(int argc, const char *const *argv) {
 
         FILE *in = fdopen(infd, "rb");
         expect(in, infile);
-        printf("reading infile: %s\n", infile);
+        debug("reading infile: %s\n", infile);
 
         FILE * outtmp = tmpfile();
         expect(outtmp, "unable to open temp file");
@@ -303,5 +375,5 @@ main(int argc, const char *const *argv) {
             expect(bytes_written == bytes_read, "didnt write output file completely");
           }
         } while (!feof(outtmp));
-        printf("wrote outfile: %s\n", outfile);
+        debug("wrote outfile: %s\n", outfile);
 }
